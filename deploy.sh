@@ -95,6 +95,15 @@ sudo apt install -y certbot python3-certbot-nginx
 # Install PM2 for process management
 print_status "Cài đặt PM2..."
 sudo npm install -g pm2
+sudo npm install -g pm2-logrotate
+
+# Configure PM2
+print_status "Cấu hình PM2..."
+pm2 install pm2-logrotate
+pm2 set pm2-logrotate:max_size 10M
+pm2 set pm2-logrotate:retain 7
+pm2 set pm2-logrotate:compress true
+pm2 set pm2-logrotate:dateFormat YYYY-MM-DD_HH-mm-ss
 
 # Create project directory
 print_status "Tạo thư mục dự án..."
@@ -147,26 +156,53 @@ RestartSec=10
 WantedBy=multi-user.target
 EOF
 
-# Create systemd service for frontend
-print_status "Tạo systemd service cho frontend..."
-sudo tee /etc/systemd/system/gemini-frontend.service > /dev/null <<EOF
-[Unit]
-Description=Gemini AI Frontend
-After=network.target
-
-[Service]
-Type=simple
-User=$USER
-WorkingDirectory=$PROJECT_DIR/frontend
-ExecStart=/usr/bin/npm start
-Restart=always
-RestartSec=10
-Environment=NODE_ENV=production
-Environment=PORT=$FRONTEND_PORT
-
-[Install]
-WantedBy=multi-user.target
+# Create PM2 ecosystem file
+print_status "Tạo PM2 ecosystem file..."
+tee $PROJECT_DIR/ecosystem.config.js > /dev/null <<EOF
+module.exports = {
+  apps: [
+    {
+      name: 'gemini-backend',
+      script: 'app.py',
+      cwd: '$PROJECT_DIR/backend',
+      interpreter: '$PROJECT_DIR/venv/bin/python',
+      instances: 1,
+      autorestart: true,
+      watch: false,
+      max_memory_restart: '1G',
+      env: {
+        NODE_ENV: 'production',
+        PORT: $BACKEND_PORT
+      },
+      error_file: '$PROJECT_DIR/logs/backend-error.log',
+      out_file: '$PROJECT_DIR/logs/backend-out.log',
+      log_file: '$PROJECT_DIR/logs/backend-combined.log',
+      time: true
+    },
+    {
+      name: 'gemini-frontend',
+      script: 'npm',
+      args: 'start',
+      cwd: '$PROJECT_DIR/frontend',
+      instances: 1,
+      autorestart: true,
+      watch: false,
+      max_memory_restart: '1G',
+      env: {
+        NODE_ENV: 'production',
+        PORT: $FRONTEND_PORT
+      },
+      error_file: '$PROJECT_DIR/logs/frontend-error.log',
+      out_file: '$PROJECT_DIR/logs/frontend-out.log',
+      log_file: '$PROJECT_DIR/logs/frontend-combined.log',
+      time: true
+    }
+  ]
+};
 EOF
+
+# Create logs directory
+mkdir -p $PROJECT_DIR/logs
 
 # Create Nginx configuration
 print_status "Tạo cấu hình Nginx..."
@@ -249,13 +285,20 @@ sudo systemctl reload nginx
 print_status "Lấy SSL certificate từ Let's Encrypt..."
 sudo certbot --nginx -d $DOMAIN_NAME -d www.$DOMAIN_NAME --email $EMAIL_ADDRESS --agree-tos --non-interactive
 
-# Enable and start services
-print_status "Khởi động các services..."
-sudo systemctl daemon-reload
-sudo systemctl enable gemini-backend
-sudo systemctl enable gemini-frontend
-sudo systemctl start gemini-backend
-sudo systemctl start gemini-frontend
+# Start applications with PM2
+print_status "Khởi động ứng dụng với PM2..."
+cd $PROJECT_DIR
+pm2 start ecosystem.config.js
+pm2 save
+pm2 startup
+
+# Wait for applications to start
+print_status "Chờ ứng dụng khởi động..."
+sleep 10
+
+# Check PM2 status
+print_status "Kiểm tra trạng thái PM2..."
+pm2 status
 
 # Create deployment script
 print_status "Tạo script deploy tự động..."
@@ -269,8 +312,7 @@ cd frontend
 npm install
 npm run build
 cd ..
-sudo systemctl restart gemini-backend
-sudo systemctl restart gemini-frontend
+pm2 restart all
 echo "Deploy completed!"
 EOF
 
@@ -301,8 +343,9 @@ print_status "Tạo script monitoring..."
 tee $PROJECT_DIR/monitor.sh > /dev/null <<EOF
 #!/bin/bash
 echo "=== Gemini AI Image Generator Status ==="
-echo "Backend: \$(sudo systemctl is-active gemini-backend)"
-echo "Frontend: \$(sudo systemctl is-active gemini-frontend)"
+echo "PM2 Status:"
+pm2 status
+echo ""
 echo "Nginx: \$(sudo systemctl is-active nginx)"
 echo ""
 echo "=== Disk Usage ==="
@@ -311,8 +354,11 @@ echo ""
 echo "=== Memory Usage ==="
 free -h
 echo ""
-echo "=== Recent Logs ==="
-sudo journalctl -u gemini-backend -n 10 --no-pager
+echo "=== Recent PM2 Logs ==="
+pm2 logs --lines 20
+echo ""
+echo "=== Nginx Error Logs ==="
+sudo tail -n 10 /var/log/nginx/error.log
 EOF
 
 chmod +x $PROJECT_DIR/monitor.sh
@@ -341,17 +387,19 @@ echo "🌐 Website: https://$DOMAIN_NAME"
 echo "📧 Email: $EMAIL_ADDRESS"
 echo ""
 echo "📁 Project directory: $PROJECT_DIR"
-echo "🔧 Backend service: gemini-backend"
-echo "🎨 Frontend service: gemini-frontend"
+echo "🔧 Backend app: gemini-backend (PM2)"
+echo "🎨 Frontend app: gemini-frontend (PM2)"
 echo ""
 echo "📋 Các lệnh hữu ích:"
 echo "  - Kiểm tra status: $PROJECT_DIR/monitor.sh"
 echo "  - Backup dữ liệu: $PROJECT_DIR/backup.sh"
 echo "  - Update code: $PROJECT_DIR/deploy-update.sh"
-echo "  - Restart services: sudo systemctl restart gemini-backend gemini-frontend"
-echo "  - View logs: sudo journalctl -u gemini-backend -f"
+echo "  - Restart apps: pm2 restart all"
+echo "  - View logs: pm2 logs"
+echo "  - PM2 status: pm2 status"
 echo ""
 echo "🔒 SSL certificate sẽ tự động renew mỗi ngày"
 echo "🛡️ Firewall đã được cấu hình bảo mật"
 echo ""
 print_success "Dự án đã sẵn sàng sử dụng!"
+
